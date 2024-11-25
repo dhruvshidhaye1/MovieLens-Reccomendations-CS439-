@@ -129,40 +129,85 @@ def user_based_cf(train_data, unique_users, unique_items, user_item_matrix):
     return predicted_ratings
 
 # TensorFlow Neural Model
-def tensorflow_model(train_data, unique_users, unique_items):
+def tensorflow_model_with_features(train_data, unique_users, unique_items, tags, movies):
+    #handle_cold_start(unique_users, unique_items, train_data)
     num_users = len(unique_users)
     num_items = len(unique_items)
 
+    # Extract and encode genres
+    movie_genres = {row['movieId']: row['genres'].split('|') for row in movies.to_dicts()}
+    unique_genres = sorted(set(genre for genres in movie_genres.values() for genre in genres))
+    genre_to_idx = {genre: idx for idx, genre in enumerate(unique_genres)}
+    num_genres = len(unique_genres)
+
+    #Encode genres using NumPy
+    def encode_genres(movie_id):
+        genre_vector = np.zeros(num_genres)
+        for genre in movie_genres.get(movie_id, []):
+            if genre in genre_to_idx:
+                genre_vector[genre_to_idx[genre]] = 1
+        return genre_vector
+
+    # Extract and encode tags
+    tag_data = tags.to_dict(as_series=False)
+    tag_dict = {}
+    for i in range(len(tag_data['userId'])):
+        user_id = tag_data['userId'][i]
+        movie_id = tag_data['movieId'][i]
+        tag = tag_data['tag'][i]
+        if user_id not in tag_dict:
+            tag_dict[user_id] = {}
+        if movie_id not in tag_dict[user_id]:
+            tag_dict[user_id][movie_id] = []
+        tag_dict[user_id][movie_id].append(tag)
+
+    # Calculate tag strength as a count of tags
+    def get_tag_score(user_id, movie_id):
+        return len(tag_dict.get(user_id, {}).get(movie_id, []))
+
+    # Prepare the data
+    user_idx_map = {user: idx for idx, user in enumerate(unique_users)}
+    item_idx_map = {item: idx for idx, item in enumerate(unique_items)}
+    user_indices = train_data['userId'].to_numpy()
+    item_indices = train_data['movieId'].to_numpy()
+    ratings = train_data['rating'].to_numpy()
+
+    user_indices = np.vectorize(user_idx_map.get)(user_indices)
+    item_indices = np.vectorize(item_idx_map.get)(item_indices)
+
+    genre_features = np.array([encode_genres(movie_id) for movie_id in train_data['movieId'].to_numpy()])
+    tag_scores = np.array([get_tag_score(user_id, movie_id) for user_id, movie_id in zip(train_data['userId'], train_data['movieId'])])
+
     # Model inputs
-    user_input = Input(shape=(1,))
-    item_input = Input(shape=(1,))
+    user_input = Input(shape=(1,), name='user_input')
+    item_input = Input(shape=(1,), name='item_input')
+    genre_input = Input(shape=(num_genres,), name='genre_input')
+    tag_input = Input(shape=(1,), name='tag_input')
+
+    # Embeddings for user and items
     user_embedding = Embedding(num_users, 50)(user_input)
     item_embedding = Embedding(num_items, 50)(item_input)
     user_flat = Flatten()(user_embedding)
     item_flat = Flatten()(item_embedding)
-    concat = Concatenate()([user_flat, item_flat])
-    dense = Dense(64, activation='relu')(concat)
-    output = Dense(1)(dense)
 
-    model = Model(inputs=[user_input, item_input], outputs=output)
+    # Combine all inputs
+    concat = Concatenate()([user_flat, item_flat, genre_input, tag_input])
+    dense_1 = Dense(128, activation='relu')(concat)
+    dense_2 = Dense(64, activation='relu')(dense_1)
+    output = Dense(1, name='rating_output')(dense_2)
+
+    model = Model(inputs=[user_input, item_input, genre_input, tag_input], outputs=output)
     model.compile(optimizer='adam', loss='mean_squared_error', metrics=['mae'])
     model.summary()
 
-    # Train data preparation using Polars and NumPy
-    user_idx_map = {user: idx for idx, user in enumerate(unique_users)}
-    item_idx_map = {item: idx for idx, item in enumerate(unique_items)}
-
-    # Use Polars `.apply()` for efficient mapping to indices
-    user_indices = train_data['userId'].to_numpy()
-    item_indices = train_data['movieId'].to_numpy()
-
-    # Map users and items to indices
-    user_indices = np.vectorize(user_idx_map.get)(user_indices)
-    item_indices = np.vectorize(item_idx_map.get)(item_indices)
-    ratings = train_data['rating'].to_numpy()
-
     # Train the model
-    model.fit([user_indices, item_indices], ratings, epochs=5, batch_size=32, verbose=1)
+    model.fit(
+        [user_indices, item_indices, genre_features, tag_scores],
+        ratings,
+        epochs=5,
+        batch_size=32,
+        verbose=1
+    )
 
     # Generate predictions
     all_user_indices = np.arange(num_users)
@@ -170,7 +215,15 @@ def tensorflow_model(train_data, unique_users, unique_items):
     user_grid, item_grid = np.meshgrid(all_user_indices, all_item_indices)
     user_grid_flat = user_grid.flatten()
     item_grid_flat = item_grid.flatten()
-    predicted_ratings = model.predict([user_grid_flat, item_grid_flat], verbose=0)
+
+    # Generate genre and tag features for all item-user pairs
+    genre_features_grid = np.array([encode_genres(unique_items[item]) for item in item_grid_flat])
+    tag_scores_grid = np.array([get_tag_score(unique_users[user], unique_items[item]) for user, item in zip(user_grid_flat, item_grid_flat)])
+
+    predicted_ratings = model.predict(
+        [user_grid_flat, item_grid_flat, genre_features_grid, tag_scores_grid],
+        verbose=0
+    )
     return predicted_ratings.reshape(num_users, num_items)
 
 # Evaluate MAE and RMSE
@@ -215,9 +268,9 @@ def create_user_item_matrix_with_tags(data, unique_users, unique_items, tags):
 
 # Main function
 def main():
-    ratings = load_data('/common/home/dhr41/Documents/ml-latest-small/ratings.csv')
-    movies = load_data('/common/home/dhr41/Documents/ml-latest-small/movies.csv')
-    tags = load_data('/common/home/dhr41/Documents/ml-latest-small/tags.csv')
+    ratings = load_data('ratings.csv')
+    movies = load_data('movies.csv')
+    tags = load_data('tags.csv')
 
     train_data, test_data = preprocess_data(ratings)
     unique_users = sorted(ratings['userId'].unique())
@@ -249,7 +302,7 @@ def main():
 
     # TensorFlow Model
     print("Running TensorFlow Model...")
-    predicted_ratings_tf = tensorflow_model(train_data, unique_users, unique_items)
+    predicted_ratings_tf = tensorflow_model_with_features(train_data, unique_users, unique_items, tags, movies)
     precision_tf, recall_tf, f_measure_tf, ndcg_tf = evaluate_recommendations(
         generate_recommendations(predicted_ratings_tf, unique_users, unique_items, train_data), test_data
     )
