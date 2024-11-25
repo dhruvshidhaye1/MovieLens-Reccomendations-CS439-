@@ -1,113 +1,18 @@
 import os
+import random
 os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # Disable GPU usage
 import polars as pl
 import numpy as np
 from sklearn.metrics import mean_absolute_error, mean_squared_error
-import scipy
 from scipy.sparse.linalg import svds
 import math
-from sklearn.preprocessing import MultiLabelBinarizer
-from sklearn.preprocessing import LabelEncoder
-import tensorflow as tf
 from tensorflow.keras.layers import Input, Embedding, Flatten, Concatenate, Dense
 from tensorflow.keras.models import Model
-
-import random
-
 
 # Load data with Polars
 def load_data(file_path):
     return pl.read_csv(file_path)
 
-# Cold start: Use tags to handle new items/users
-def handle_cold_start_with_tags(unique_users, unique_items, tags, movies, user_item_matrix):
-    tag_data = tags.to_dict(as_series=False)
-    tag_counts = {}
-
-    for movie_id in unique_items:
-        tag_counts[movie_id] = 0
-
-    for i in range(len(tag_data['movieId'])):
-        movie_id = tag_data['movieId'][i]
-        if movie_id in tag_counts:
-            tag_counts[movie_id] += 1
-
-    item_means = np.array([
-        np.mean(user_item_matrix[:, i][user_item_matrix[:, i] > 0]) if np.any(user_item_matrix[:, i] > 0) else 0
-        for i in range(len(unique_items))
-    ])
-
-    # Incorporate tag frequency into cold start scores
-    cold_start_scores = item_means + 0.05 * np.array([tag_counts[item] for item in unique_items])
-    return cold_start_scores
-
-def create_user_item_matrix(data, movies, tags):
-    data = data.to_dicts()
-    users, items, ratings = zip(*[(d['userId'], d['movieId'], d['rating']) for d in data])
-    user_item_matrix = {}
-    
-    # Extract genres and tags information
-    movies_dict = movies.to_dict(as_series=False)
-    tags_dict = tags.to_dict(as_series=False)
-
-    movie_genres = {movies_dict['movieId'][i]: movies_dict['genres'][i].split('|') for i in range(len(movies_dict['movieId']))}
-    user_tags = {}
-    
-    for i in range(len(tags_dict['userId'])):
-        user_id = tags_dict['userId'][i]
-        movie_id = tags_dict['movieId'][i]
-        tag = tags_dict['tag'][i]
-        if user_id not in user_tags:
-            user_tags[user_id] = {}
-        if movie_id not in user_tags[user_id]:
-            user_tags[user_id][movie_id] = []
-        user_tags[user_id][movie_id].append(tag)
-    
-    # Create user-item ratings
-    for user, item, rating in zip(users, items, ratings):
-        if user not in user_item_matrix:
-            user_item_matrix[user] = {}
-        user_item_matrix[user][item] = rating
-    
-    unique_users = sorted(set(users))
-    unique_items = sorted(set(items))
-    
-    # Genre Encoding using MultiLabelBinarizer
-    mlb = MultiLabelBinarizer()
-    genre_matrix = mlb.fit_transform(movie_genres.values())
-    genre_labels = list(movie_genres.keys())
-    genre_dict = {genre_labels[i]: genre_matrix[i] for i in range(len(genre_labels))}
-    
-    # Create a 2D matrix with rows as users and columns as items
-    matrix = np.zeros((len(unique_users), len(unique_items)))
-    for user_idx, user in enumerate(unique_users):
-        for item_idx, item in enumerate(unique_items):
-            rating = user_item_matrix.get(user, {}).get(item, 0)
-            genre_vector = genre_dict.get(item, np.zeros(genre_matrix.shape[1]))
-            tag_score = len(user_tags.get(user, {}).get(item, []))
-            # Combine rating, genre preference, and tag score
-            combined_score = rating + 0.1 * np.sum(genre_vector) + 0.05 * tag_score
-            matrix[user_idx, item_idx] = combined_score
-            
-    return matrix, unique_users, unique_items
-    
-
-def preprocess_data2(ratings, test_size=0.2):
-    unique_users = ratings['userId'].unique()
-    train_rows = []
-    test_rows = []
-    
-    for user in unique_users:
-        user_ratings = ratings.filter(pl.col('userId') == user)
-        train_count = int((1 - test_size) * user_ratings.height)
-        train_rows.append(user_ratings[:train_count])
-        test_rows.append(user_ratings[train_count:])
-    
-    train_data = pl.concat(train_rows)
-    test_data = pl.concat(test_rows)
-    return train_data, test_data
-
-# Preprocess data: Train-test split
 # Weighted random sampling for train-test split
 def preprocess_data(ratings, test_size=0.2):
     unique_users = ratings['userId'].unique()
@@ -131,128 +36,30 @@ def preprocess_data(ratings, test_size=0.2):
     test_data = pl.concat(test_rows)
     return train_data, test_data
 
-# Update create_user_item_matrix to include tags
-def create_user_item_matrix_with_tags(data, unique_users, unique_items, tags):
+# Create user-item matrix with confidence weighting
+def create_user_item_matrix(data, unique_users, unique_items):
     user_idx_map = {user: idx for idx, user in enumerate(unique_users)}
     item_idx_map = {item: idx for idx, item in enumerate(unique_items)}
     matrix = np.zeros((len(unique_users), len(unique_items)))
-
-    # Create a tag dictionary for lookup
-    tag_data = tags.to_dict(as_series=False)
-    tag_dict = {}
-    for i in range(len(tag_data['userId'])):
-        user_id = tag_data['userId'][i]
-        item_id = tag_data['movieId'][i]
-        tag = tag_data['tag'][i]
-        if user_id not in tag_dict:
-            tag_dict[user_id] = {}
-        if item_id not in tag_dict[user_id]:
-            tag_dict[user_id][item_id] = []
-        tag_dict[user_id][item_id].append(tag)
 
     for row in data.iter_rows(named=True):
         user_idx = user_idx_map[row['userId']]
         item_idx = item_idx_map[row['movieId']]
         rating = row['rating']
         
-        # Apply confidence weighting based on tags
-        user_tags = tag_dict.get(row['userId'], {}).get(row['movieId'], [])
-        tag_score = len(user_tags)  # Number of tags indicates preference strength
-        confidence = 1 + math.log(1 + rating + 0.1 * tag_score)
+        # Apply confidence weighting
+        confidence = 1 + math.log(1 + row['rating'])  # Higher ratings carry more confidence
         matrix[user_idx, item_idx] = rating * confidence
 
     return matrix
 
-
-# Generate recommendations with personalized weighting
-def generate_recommendations(predicted_ratings, unique_users, unique_items, train_data, top_n=10):
-    train_items = train_data.to_dict(as_series=False)
-    recommendations = {}
-
-    for user_id in unique_users:
-        user_idx = unique_users.index(user_id)
-        user_predictions = predicted_ratings[user_idx]
-        
-        rated_items = set(train_items['movieId'][i] for i in range(len(train_items['userId'])) if train_items['userId'][i] == user_id)
-        unrated_items = [i for i in range(len(unique_items)) if unique_items[i] not in rated_items]
-        
-        # Weight recommendations by confidence
-        top_items = sorted(unrated_items, key=lambda x: -user_predictions[x])[:top_n]
-        recommended_item_ids = [unique_items[i] for i in top_items]
-        recommendations[user_id] = recommended_item_ids
-
-    return recommendations
-
-
-# Improved SVD Recommendation
-# def svd_recommendation(user_item_matrix, num_factors=100):
-#     U, sigma, Vt = svds(user_item_matrix, k=num_factors)
-#     sigma = np.diag(sigma)
-#     predicted_ratings = np.dot(np.dot(U, sigma), Vt)
-#     return predicted_ratings
-
-# Matrix Factorization (SVD)
-# def svd_recommendation(user_item_matrix, num_factors=100):
-#     # Fill missing values with user or item means to improve precision
-#     filled_matrix = user_item_matrix.copy()
-#     item_means = np.where(user_item_matrix.sum(axis=0) != 0, user_item_matrix.sum(axis=0) / (user_item_matrix != 0).sum(axis=0), 0)
-#     for i in range(filled_matrix.shape[0]):
-#         for j in range(filled_matrix.shape[1]):
-#             if filled_matrix[i, j] == 0:
-#                 filled_matrix[i, j] = item_means[j]
-
-#     U, sigma, Vt = svds(filled_matrix, k=num_factors)
-#     sigma = np.diag(sigma)
-#     predicted_ratings = np.dot(np.dot(U, sigma), Vt)
-
-#     return predicted_ratings
-
-# User-based Collaborative Filtering
-def user_based_cf(train_data, unique_users, unique_items):
-    # Create user-item matrix
-    user_item_matrix = np.zeros((len(unique_users), len(unique_items)))
-
-    # Fill the matrix with ratings
-    for row in train_data.iter_rows(named=True):
-        user_idx = unique_users.index(row['userId'])
-        item_idx = unique_items.index(row['movieId'])
-        user_item_matrix[user_idx, item_idx] = row['rating']
-
-    # Compute user-user similarity matrix using cosine similarity
-    user_similarity = np.corrcoef(user_item_matrix)
-
-    # Predict ratings
-    predicted_ratings = np.zeros_like(user_item_matrix)
-    for user_idx in range(len(unique_users)):
-        # For each user, predict the rating for each item
-        for item_idx in range(len(unique_items)):
-            if user_item_matrix[user_idx, item_idx] == 0:  # Predict only for unrated items
-                # Weighted average of ratings from similar users
-                numerator = np.dot(
-                    user_similarity[user_idx],
-                    user_item_matrix[:, item_idx]
-                )
-                denominator = np.sum(np.abs(user_similarity[user_idx]))
-                predicted_ratings[user_idx, item_idx] = numerator / denominator if denominator != 0 else 0
-
-    return predicted_ratings
-
-
-
-def svd_recommendation2(user_item_matrix, num_factors=100):
-    # Fill missing values with user or item means to improve precision
-    filled_matrix = user_item_matrix.copy()
-    item_means = np.where(user_item_matrix.sum(axis=0) != 0, user_item_matrix.sum(axis=0) / (user_item_matrix != 0).sum(axis=0), 0)
-    for i in range(filled_matrix.shape[0]):
-        for j in range(filled_matrix.shape[1]):
-            if filled_matrix[i, j] == 0:
-                filled_matrix[i, j] = item_means[j]
-
-    U, sigma, Vt = svds(filled_matrix, k=num_factors)
-    sigma = np.diag(sigma)
-    predicted_ratings = np.dot(np.dot(U, sigma), Vt)
-
-    return predicted_ratings
+# Cold start: Use average rating for new items/users
+def handle_cold_start(unique_users, unique_items, user_item_matrix):
+    item_means = np.array([
+        np.mean(user_item_matrix[:, i][user_item_matrix[:, i] > 0]) if np.any(user_item_matrix[:, i] > 0) else 0
+        for i in range(len(unique_items))
+    ])
+    return item_means
 
 # Improved SVD Recommendation
 def svd_recommendation(user_item_matrix, num_factors=100):
@@ -273,7 +80,7 @@ def generate_recommendations(predicted_ratings, unique_users, unique_items, trai
         rated_items = set(train_items['movieId'][i] for i in range(len(train_items['userId'])) if train_items['userId'][i] == user_id)
         unrated_items = [i for i in range(len(unique_items)) if unique_items[i] not in rated_items]
         
-        # Weight recommendations by confidence
+        # Sort and get top N
         top_items = sorted(unrated_items, key=lambda x: -user_predictions[x])[:top_n]
         recommended_item_ids = [unique_items[i] for i in top_items]
         recommendations[user_id] = recommended_item_ids
@@ -313,203 +120,143 @@ def evaluate_recommendations(recommendations, test_data, top_n=10):
     )
     return avg_precision, avg_recall, f_measure, avg_ndcg
 
-# Evaluation metrics: MAE and RMSE
-def evaluate(predictions, actual, mask):
-    predictions = predictions[mask]
-    actual = actual[mask]
+# User-Based CF
+def user_based_cf(train_data, unique_users, unique_items, user_item_matrix):
+    handle_cold_start(unique_users, unique_items, user_item_matrix)
+    similarity = np.corrcoef(user_item_matrix)
+    predicted_ratings = np.dot(similarity, user_item_matrix) / np.array(
+        [np.abs(similarity).sum(axis=1)]).T
+    return predicted_ratings
+
+# TensorFlow Neural Model
+def tensorflow_model(train_data, unique_users, unique_items):
+    num_users = len(unique_users)
+    num_items = len(unique_items)
+
+    # Model inputs
+    user_input = Input(shape=(1,))
+    item_input = Input(shape=(1,))
+    user_embedding = Embedding(num_users, 50)(user_input)
+    item_embedding = Embedding(num_items, 50)(item_input)
+    user_flat = Flatten()(user_embedding)
+    item_flat = Flatten()(item_embedding)
+    concat = Concatenate()([user_flat, item_flat])
+    dense = Dense(64, activation='relu')(concat)
+    output = Dense(1)(dense)
+
+    model = Model(inputs=[user_input, item_input], outputs=output)
+    model.compile(optimizer='adam', loss='mean_squared_error', metrics=['mae'])
+    model.summary()
+
+    # Train data preparation using Polars and NumPy
+    user_idx_map = {user: idx for idx, user in enumerate(unique_users)}
+    item_idx_map = {item: idx for idx, item in enumerate(unique_items)}
+
+    # Use Polars `.apply()` for efficient mapping to indices
+    user_indices = train_data['userId'].to_numpy()
+    item_indices = train_data['movieId'].to_numpy()
+
+    # Map users and items to indices
+    user_indices = np.vectorize(user_idx_map.get)(user_indices)
+    item_indices = np.vectorize(item_idx_map.get)(item_indices)
+    ratings = train_data['rating'].to_numpy()
+
+    # Train the model
+    model.fit([user_indices, item_indices], ratings, epochs=5, batch_size=32, verbose=1)
+
+    # Generate predictions
+    all_user_indices = np.arange(num_users)
+    all_item_indices = np.arange(num_items)
+    user_grid, item_grid = np.meshgrid(all_user_indices, all_item_indices)
+    user_grid_flat = user_grid.flatten()
+    item_grid_flat = item_grid.flatten()
+    predicted_ratings = model.predict([user_grid_flat, item_grid_flat], verbose=0)
+    return predicted_ratings.reshape(num_users, num_items)
+
+# Evaluate MAE and RMSE
+def evaluate(predicted_ratings, actual_ratings, mask):
+    actual = actual_ratings[mask]
+    predictions = predicted_ratings[mask]
     mae = mean_absolute_error(actual, predictions)
     rmse = math.sqrt(mean_squared_error(actual, predictions))
     return mae, rmse
 
+# Create user-item matrix with weighting and tags
+def create_user_item_matrix_with_tags(data, unique_users, unique_items, tags):
+    user_idx_map = {user: idx for idx, user in enumerate(unique_users)}
+    item_idx_map = {item: idx for idx, item in enumerate(unique_items)}
+    matrix = np.zeros((len(unique_users), len(unique_items)))
 
-###OUR APPROACH
-# Proprietary Algorithm: Feature-Rich Neural Matrix Factorization (FR-NMF)
-# Proprietary Algorithm: Feature-Rich Neural Matrix Factorization (FR-NMF)
-# def feature_rich_nmf(train_data, movies, tags, unique_users, unique_items, num_factors=50, epochs=10, batch_size=64):
-#     # Encoding user IDs and item IDs
-#     user_encoder = LabelEncoder()
-#     item_encoder = LabelEncoder()
+    # Create a tag dictionary for lookup
+    tag_data = tags.to_dict(as_series=False)
+    tag_dict = {}
+    for i in range(len(tag_data['userId'])):
+        user_id = tag_data['userId'][i]
+        item_id = tag_data['movieId'][i]
+        tag = tag_data['tag'][i]
+        if user_id not in tag_dict:
+            tag_dict[user_id] = {}
+        if item_id not in tag_dict[user_id]:
+            tag_dict[user_id][item_id] = []
+        tag_dict[user_id][item_id].append(tag)
 
-#     train_data_dict = train_data.to_dict(as_series=False)
-#     user_ids = user_encoder.fit_transform(train_data_dict['userId'])
-#     item_ids = item_encoder.fit_transform(train_data_dict['movieId'])
-#     ratings = np.array(train_data_dict['rating'])
+    for row in data.iter_rows(named=True):
+        user_idx = user_idx_map[row['userId']]
+        item_idx = item_idx_map[row['movieId']]
+        rating = row['rating']
 
-#     num_users = len(unique_users)
-#     num_items = len(unique_items)
-    
-#     # Extract genres and create a mapping of movieId to index in the genre_encoded array
-#     movie_genres = {row['movieId']: row['genres'].split('|') for row in movies.to_dicts()}
-#     mlb = MultiLabelBinarizer()
-#     genre_encoded = mlb.fit_transform(movie_genres.values())
-#     genre_labels = list(movie_genres.keys())
-#     genre_mapping = {genre_labels[i]: i for i in range(len(genre_labels))}
+        # Apply confidence weighting based on tags
+        user_tags = tag_dict.get(row['userId'], {}).get(row['movieId'], [])
+        tag_score = len(user_tags)  # Number of tags indicates preference strength
+        confidence = 1 + math.log(1 + rating + 0.1 * tag_score)
+        matrix[user_idx, item_idx] = rating * confidence
 
-#     genre_input_dim = genre_encoded.shape[1]
-
-#     # Model Definition
-#     user_input = Input(shape=(1,))
-#     item_input = Input(shape=(1,))
-#     genre_input = Input(shape=(genre_input_dim,))
-
-#     user_embedding = Embedding(num_users, num_factors)(user_input)
-#     item_embedding = Embedding(num_items, num_factors)(item_input)
-
-#     user_vector = Flatten()(user_embedding)
-#     item_vector = Flatten()(item_embedding)
-
-#     # Concatenate user, item, and genre vectors
-#     concatenated = Concatenate()([user_vector, item_vector, genre_input])
-#     dense_1 = Dense(128, activation='relu')(concatenated)
-#     dense_2 = Dense(64, activation='relu')(dense_1)
-#     dense_3 = Dense(32, activation='relu')(dense_2)
-#     output = Dense(1)(dense_3)
-
-#     model = Model(inputs=[user_input, item_input, genre_input], outputs=output)
-#     model.compile(optimizer='adam', loss='mean_squared_error', metrics=['mae'])
-
-#     # Preparing input data
-#     genre_features = []
-#     for movie_id in train_data_dict['movieId']:
-#         if movie_id in genre_mapping:
-#             genre_features.append(genre_encoded[genre_mapping[movie_id]])
-#         else:
-#             genre_features.append(np.zeros(genre_input_dim))  # If no genre info is available, use zeros
-
-#     genre_features = np.array(genre_features)
-
-#     # Training the model
-#     model.fit([user_ids, item_ids, genre_features], ratings, epochs=epochs, batch_size=batch_size, verbose=1)
-
-#     # Predicting the full user-item rating matrix
-#     all_user_ids = np.arange(num_users)
-#     all_item_ids = np.arange(num_items)
-
-#     # Predict ratings for all user-item pairs
-#     user_grid, item_grid = np.meshgrid(all_user_ids, all_item_ids)
-#     user_grid_flat = user_grid.flatten()
-#     item_grid_flat = item_grid.flatten()
-#     genre_grid_flat = np.array([genre_encoded[genre_mapping.get(unique_items[i], 0)] for i in item_grid_flat])
-
-#     predicted_ratings = model.predict([user_grid_flat, item_grid_flat, genre_grid_flat])
-#     predicted_ratings_matrix = predicted_ratings.reshape((num_users, num_items))
-
-#     return predicted_ratings_matrix
-
+    return matrix
 
 # Main function
 def main():
-    # Load data
     ratings = load_data('/common/home/dhr41/Documents/ml-latest-small/ratings.csv')
     movies = load_data('/common/home/dhr41/Documents/ml-latest-small/movies.csv')
     tags = load_data('/common/home/dhr41/Documents/ml-latest-small/tags.csv')
 
-    # Preprocess data
-    print("Preprocessing data...")
-    train_data, test_data = preprocess_data2(ratings)
-
-    # Create user-item matrix
-    print("Creating user-item matrix...")
-    user_item_matrix, users, items = create_user_item_matrix(train_data, movies, tags)
-    users2=users
-
-    # SVD Recommendation
-    print("Performing SVD...")
-    predicted_ratings_svd = svd_recommendation2(user_item_matrix)
-
-    # # Evaluate SVD predictions
-    # print("Evaluating SVD predictions...")
-    mask = user_item_matrix > 0
-    mae_svd, rmse_svd = evaluate(predicted_ratings_svd, user_item_matrix, mask)
-    # print(f"SVD Evaluation - MAE: {mae_svd:.4f}, RMSE: {rmse_svd:.4f}")
-
-    # # Generate recommendations using SVD
-    # print("Generating recommendations using SVD...")
-    # recommendations_svd = generate_recommendations(predicted_ratings_svd, users, items, train_data)
-
-    # # Evaluate recommendations using SVD
-    # print("Evaluating recommendations using SVD...")
-    # precision_svd, recall_svd, f_measure_svd, ndcg_svd = evaluate_recommendations(recommendations_svd, test_data)
-    # print(
-    #     f"SVD Recommendation Evaluation - Precision: {precision_svd:.4f}, Recall: {recall_svd:.4f}, "
-    #     f"F-Measure: {f_measure_svd:.4f}, NDCG: {ndcg_svd:.4f}"
-    # )
-
-    # Preprocess data
     train_data, test_data = preprocess_data(ratings)
     unique_users = sorted(ratings['userId'].unique())
     unique_items = sorted(ratings['movieId'].unique())
-    unique_items2=unique_items.copy()
 
-    # Create user-item matrix with tags
-    train_data2=train_data
     user_item_matrix = create_user_item_matrix_with_tags(train_data, unique_users, unique_items, tags)
 
-    # SVD Recommendation
-    predicted_ratings = svd_recommendation(user_item_matrix)
+    # SVD
+    print("Running SVD...")
+    predicted_ratings_svd = svd_recommendation(user_item_matrix)
+    recommendations_svd = generate_recommendations(predicted_ratings_svd, unique_users, unique_items, train_data)
+    precision_svd, recall_svd, f_measure_svd, ndcg_svd = evaluate_recommendations(recommendations_svd, test_data)
+    mae_svd, rmse_svd = evaluate(predicted_ratings_svd, user_item_matrix, user_item_matrix > 0)
+    print(f"SVD: MAE={mae_svd:.4f}, RMSE={rmse_svd:.4f}, Precision={precision_svd:.4f}, Recall={recall_svd:.4f}, F-measure={f_measure_svd:.4f}, NDCG={ndcg_svd:.4f}")
+    print("WRITING SVD MODEL TOP10 Ratings to reccomendations.txt -- Models running afterwards are sanity checks.")
+    # Write recommendations to file
+    with open("recommendations.txt", "w") as f:
+        for user, items in recommendations_svd.items():
+            f.write(f"User {user}: {', '.join(map(str, items))}\n")
 
-    # Handle cold start with tags
-    cold_start_scores = handle_cold_start_with_tags(unique_users, unique_items, tags, movies, user_item_matrix)
-
-    # Generate recommendations
-    recommendations = generate_recommendations(predicted_ratings, unique_users, unique_items, train_data)
-
-    # Evaluate recommendations
-    precision, recall, f_measure, ndcg = evaluate_recommendations(recommendations, test_data)
-    print("__________________________________________")
-    print("SVD Results")
-    print(f"Precision: {precision:.4f}, Recall: {recall:.4f}, F-Measure: {f_measure:.4f}, NDCG: {ndcg:.4f}")
-
-    # User-Based Collaborative Filtering - Secondary Check
-    print("__________________________________________")
-    print("USER-BASED CF: SECONDARY CHECK")
-    
-    print("Performing User-Based Collaborative Filtering...")
-    predicted_ratings_cf = user_based_cf(train_data2, users2, unique_items2)
-
-    # Evaluate CF predictions
-    print("Evaluating User-Based CF predictions...")
-    mae_cf, rmse_cf = evaluate(predicted_ratings_cf, user_item_matrix, mask)
-    print(f"User-Based CF Evaluation - MAE: {mae_cf:.4f}, RMSE: {rmse_cf:.4f}")
-
-    # Generate recommendations using CF
-    print("Generating recommendations using User-Based CF...")
-    recommendations_cf = generate_recommendations(predicted_ratings_cf, users, items, train_data)
-
-    # Evaluate recommendations using CF
-    print("Evaluating recommendations using User-Based CF...")
-    precision_cf, recall_cf, f_measure_cf, ndcg_cf = evaluate_recommendations(recommendations_cf, test_data)
-    print(
-        f"User-Based CF Recommendation Evaluation - Precision: {precision_cf:.4f}, Recall: {recall_cf:.4f}, "
-        f"F-Measure: {f_measure_cf:.4f}, NDCG: {ndcg_cf:.4f}"
+    # User-Based CF
+    print("Running User-Based CF...")
+    predicted_ratings_cf = user_based_cf(train_data, unique_users, unique_items, user_item_matrix)
+    precision_cf, recall_cf, f_measure_cf, ndcg_cf = evaluate_recommendations(
+        generate_recommendations(predicted_ratings_cf, unique_users, unique_items, train_data), test_data
     )
-    
-    print("__________________________________________")
+    mae_cf, rmse_cf = evaluate(predicted_ratings_cf, user_item_matrix, user_item_matrix > 0)
+    print(f"User-Based CF: MAE={mae_cf:.4f}, RMSE={rmse_cf:.4f}, Precision={precision_cf:.4f}, Recall={recall_cf:.4f}, F-measure={f_measure_cf:.4f}, NDCG={ndcg_cf:.4f}")
 
-        # Feature-Rich Neural Matrix Factorization - Proprietary Check
-    # print("__________________________________________")
-    # print("FEATURE-RICH NMF: PROPRIETARY CHECK")
+    # TensorFlow Model
+    print("Running TensorFlow Model...")
+    predicted_ratings_tf = tensorflow_model(train_data, unique_users, unique_items)
+    precision_tf, recall_tf, f_measure_tf, ndcg_tf = evaluate_recommendations(
+        generate_recommendations(predicted_ratings_tf, unique_users, unique_items, train_data), test_data
+    )
+    mae_tf, rmse_tf = evaluate(predicted_ratings_tf, user_item_matrix, user_item_matrix > 0)
+    print(f"TensorFlow Model: MAE={mae_tf:.4f}, RMSE={rmse_tf:.4f}, Precision={precision_tf:.4f}, Recall={recall_tf:.4f}, F-measure={f_measure_tf:.4f}, NDCG={ndcg_tf:.4f}")
 
-    # print("Training Feature-Rich Neural Matrix Factorization Model...")
-    # predicted_ratings_fr_nmf = feature_rich_nmf(train_data, movies, tags, users, items)
-
-    # # Evaluate FR-NMF predictions
-    # print("Evaluating FR-NMF predictions...")
-    # mae_fr_nmf, rmse_fr_nmf = evaluate(predicted_ratings_fr_nmf, user_item_matrix, mask)
-    # print(f"FR-NMF Evaluation - MAE: {mae_fr_nmf:.4f}, RMSE: {rmse_fr_nmf:.4f}")
-
-    # print("__________________________________________")
-
-    # # Output results from SVD recommendations
-    # print("Writing recommendations to file...")
-    # with open("recommendations.txt", "w") as f:
-    #     f.write(
-    #         f"SVD Recommendation Evaluation - Precision: {precision_svd:.4f}, Recall: {recall_svd:.4f}, "
-    #         f"F-Measure: {f_measure_svd:.4f}, NDCG: {ndcg_svd:.4f}\n"
-    #     )
-    #     f.write("Top-10 Recommendations (SVD):\n")
-    #     for user, items in recommendations_svd.items():
-    #         f.write(f"User {user}: {', '.join(map(str, items))}\n")
+    print("All models completed.")
 
 if __name__ == "__main__":
     main()
