@@ -1,0 +1,2 @@
+1.) run pip install -r requirements.txt in your terminal
+2.) In the main method, change the file paths accordingly for movies, ratings, and tags.
